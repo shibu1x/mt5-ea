@@ -1,0 +1,61 @@
+version: '3'
+
+dotenv: ['.env']
+
+vars:
+  NAME: '{{.NAME | default "EmaTrendBasket"}}'
+
+tasks:
+  build:
+    desc: Upload, compile, and download {{.NAME}}
+    cmds:
+      - task: upload
+      - task: compile
+      - task: download
+
+  upload:
+    desc: Upload {{.NAME}}.mq5 to remote server
+    cmds:
+      - scp {{.NAME}}.mq5 {{.REMOTE_HOST}}:/tmp/{{.NAME}}.mq5
+      - ssh {{.REMOTE_HOST}} "sudo mv /tmp/{{.NAME}}.mq5 {{.REMOTE_DIR}}/ && sudo chmod 644 {{.REMOTE_DIR}}/{{.NAME}}.mq5"
+
+  compile:
+    desc: Compile {{.NAME}}.mq5 on remote MT5 server via Docker (prints the MetaEditor log)
+    cmds:
+      - |
+        ssh {{.REMOTE_HOST}} bash -s <<'EOF'
+        cd /docker
+        docker compose exec -T mt5_1 su - abc -c 'wine ".wine/drive_c/Program Files/MetaTrader 5/MetaEditor64.exe" /compile:"C:\users\abc\Documents\{{.NAME}}.mq5" /log:"C:\users\abc\Documents\{{.NAME}}.log"' || true
+        EOF
+      - |
+        ssh {{.REMOTE_HOST}} bash -s <<'EOF'
+        LOG={{.REMOTE_DIR}}/{{.NAME}}.log
+        echo "----- MetaEditor compile log ({{.NAME}}.log) -----"
+        sudo cat "$LOG" 2>/dev/null | iconv -f UTF-16 -t UTF-8 2>/dev/null || sudo cat "$LOG" 2>/dev/null | tr -d '\000'
+        echo "-------------------------------------------------"
+        sudo cat "$LOG" 2>/dev/null | iconv -f UTF-16 -t UTF-8 2>/dev/null | grep -qE '(^| )0 errors,' \
+          || { echo "compile reported errors - aborting"; exit 1; }
+        EOF
+
+  download:
+    desc: Download compiled {{.NAME}}.ex5 from remote server
+    cmds:
+      - ssh {{.REMOTE_HOST}} "sudo cp {{.REMOTE_DIR}}/{{.NAME}}.ex5 /tmp/ && sudo chmod 644 /tmp/{{.NAME}}.ex5"
+      - mkdir -p ex5
+      - scp {{.REMOTE_HOST}}:/tmp/{{.NAME}}.ex5 ex5/
+      - ssh {{.REMOTE_HOST}} "sudo cp /tmp/{{.NAME}}.ex5 /srv/samba/share/temp/"
+
+  deploy:
+    desc: Copy ex5/{{.NAME}}.ex5 to local MT5 directory
+    cmds:
+      - cp ex5/{{.NAME}}.ex5 {{.MT5_EXPERTS_DIR}}/
+
+  up:
+    desc: Start mt5_1 container on remote server
+    cmds:
+      - ssh {{.REMOTE_HOST}} "cd /docker && docker compose up -d mt5_1"
+
+  stop:
+    desc: Stop mt5_1 container on remote server
+    cmds:
+      - ssh {{.REMOTE_HOST}} "cd /docker && docker compose stop mt5_1"
