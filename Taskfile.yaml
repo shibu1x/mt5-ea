@@ -3,7 +3,7 @@ version: '3'
 dotenv: ['.env']
 
 vars:
-  NAME: '{{.NAME | default "EmaTrendBasket"}}'
+  NAME: '{{.NAME | default "DailyFadeBasket"}}'
 
 tasks:
   build:
@@ -40,10 +40,9 @@ tasks:
   download:
     desc: Download compiled {{.NAME}}.ex5 from remote server
     cmds:
-      - ssh {{.REMOTE_HOST}} "sudo cp {{.REMOTE_DIR}}/{{.NAME}}.ex5 /tmp/ && sudo chmod 644 /tmp/{{.NAME}}.ex5"
+      - ssh {{.REMOTE_HOST}} "sudo cp {{.REMOTE_DIR}}/{{.NAME}}.ex5 /srv/samba/share/temp/ && sudo cp {{.REMOTE_DIR}}/{{.NAME}}.ex5 {{.REMOTE_EXPERTS_DIR}}/"
       - mkdir -p ex5
-      - scp {{.REMOTE_HOST}}:/tmp/{{.NAME}}.ex5 ex5/
-      - ssh {{.REMOTE_HOST}} "sudo cp /tmp/{{.NAME}}.ex5 /srv/samba/share/temp/"
+      - scp {{.REMOTE_HOST}}:{{.REMOTE_DIR}}/{{.NAME}}.ex5 ex5/
 
   deploy:
     desc: Copy ex5/{{.NAME}}.ex5 to local MT5 directory

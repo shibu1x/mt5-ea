@@ -55,6 +55,8 @@ input int      MagicNumber = 9001;          // Magic Number
 
 // Global Variables
 CTrade trade;
+ulong    buyTickets[];
+ulong    sellTickets[];
 int      symbolDigits;
 int      pipFactor;
 double   pointValue;
@@ -281,58 +283,79 @@ void OnDeinit(const int reason)
 void OnTick()
 {
     UpdateReference();
-    ManageBasket(true);
-    ManageBasket(false);
+
+    int    buyCount = 0, sellCount = 0;
+    int    buyExtremePriceInt = 999999999, sellExtremePriceInt = 0;
+    double buyPipsProfit = 0, sellPipsProfit = 0;
+
+    CollectBasketData(buyCount, buyExtremePriceInt, buyPipsProfit,
+                       sellCount, sellExtremePriceInt, sellPipsProfit);
+
+    ManageBasket(true,  buyCount,  buyExtremePriceInt,  buyPipsProfit);
+    ManageBasket(false, sellCount, sellExtremePriceInt, sellPipsProfit);
 }
 
 //+------------------------------------------------------------------+
-//| Return the ticket of the position at loop index i when it        |
-//| belongs to this basket (this symbol, this magic, the given       |
-//| direction), else 0. PositionGetTicket() has already selected it  |
-//| as the current position, so callers can read its fields.         |
+//| Single PositionsTotal() pass that fills in both baskets' status  |
+//| (count, the extreme open price - lowest for buy, highest for     |
+//| sell - and the volume-weighted average pips profit) in one scan  |
+//| instead of one scan per direction, and caches each basket's      |
+//| tickets in buyTickets[] / sellTickets[] so CloseBasket() can      |
+//| close by ticket instead of re-scanning all positions. Each       |
+//| side's mark price is the price a position of that direction      |
+//| would actually close at (Bid for buy, Ask for sell), matching    |
+//| what CloseBasket() will actually realize. No account-currency    |
+//| P/L is tracked.                                                   |
 //+------------------------------------------------------------------+
-ulong GetBasketPositionTicket(int i, bool isBuy)
+void CollectBasketData(int &buyCount, int &buyExtremePriceInt, double &buyPipsProfit,
+                        int &sellCount, int &sellExtremePriceInt, double &sellPipsProfit)
 {
-    ulong ticket = PositionGetTicket(i);
-    if(ticket <= 0) return 0;
-    if(PositionGetString(POSITION_SYMBOL) != _Symbol) return 0;
-    if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) return 0;
-    if(isBuy != (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)) return 0;
-    return ticket;
-}
+    ArrayResize(buyTickets, 0);
+    ArrayResize(sellTickets, 0);
 
-//+------------------------------------------------------------------+
-//| Collect open position count, the extreme open price (lowest for  |
-//| buy, highest for sell), and the basket's volume-weighted average |
-//| pips profit - Σ((markPrice - openPrice) x direction x volume) /  |
-//| Σvolume, in pips. markPriceInt must be the side a position of    |
-//| this direction would actually close at (Bid for buy, Ask for     |
-//| sell) - not the side used to open a new one - so pipsProfit      |
-//| matches what CloseBasket() will actually realize. No account-    |
-//| currency P/L is tracked.                                         |
-//+------------------------------------------------------------------+
-void GetBasketStatus(bool isBuy, int markPriceInt, int &count, int &extremePriceInt, double &pipsProfit)
-{
-    double weightedPriceSum = 0;
-    double totalVolume = 0;
+    double buyWeightedSum = 0, buyVolume = 0;
+    double sellWeightedSum = 0, sellVolume = 0;
+
+    int buyMarkPriceInt  = PriceToInt(SymbolInfoDouble(_Symbol, SYMBOL_BID));
+    int sellMarkPriceInt = PriceToInt(SymbolInfoDouble(_Symbol, SYMBOL_ASK));
 
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
-        if(GetBasketPositionTicket(i, isBuy) == 0) continue;
+        ulong ticket = PositionGetTicket(i);
+        if(ticket <= 0) continue;
+        if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+        if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
 
-        count++;
-
+        bool isBuy = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
         double volume = PositionGetDouble(POSITION_VOLUME);
         int openPrice = PriceToInt(PositionGetDouble(POSITION_PRICE_OPEN));
-        int diffInt = isBuy ? (markPriceInt - openPrice) : (openPrice - markPriceInt);
-        weightedPriceSum += diffInt * volume;
-        totalVolume += volume;
 
-        if(isBuy) { if(openPrice < extremePriceInt) extremePriceInt = openPrice; }
-        else      { if(openPrice > extremePriceInt) extremePriceInt = openPrice; }
+        if(isBuy)
+        {
+            buyCount++;
+            buyWeightedSum += (buyMarkPriceInt - openPrice) * volume;
+            buyVolume += volume;
+            if(openPrice < buyExtremePriceInt) buyExtremePriceInt = openPrice;
+
+            int n = ArraySize(buyTickets);
+            ArrayResize(buyTickets, n + 1);
+            buyTickets[n] = ticket;
+        }
+        else
+        {
+            sellCount++;
+            sellWeightedSum += (openPrice - sellMarkPriceInt) * volume;
+            sellVolume += volume;
+            if(openPrice > sellExtremePriceInt) sellExtremePriceInt = openPrice;
+
+            int n = ArraySize(sellTickets);
+            ArrayResize(sellTickets, n + 1);
+            sellTickets[n] = ticket;
+        }
     }
 
-    pipsProfit = totalVolume > 0 ? (weightedPriceSum / totalVolume) / pipFactor : 0;
+    buyPipsProfit  = buyVolume  > 0 ? (buyWeightedSum  / buyVolume)  / pipFactor : 0;
+    sellPipsProfit = sellVolume > 0 ? (sellWeightedSum / sellVolume) / pipFactor : 0;
 }
 
 //+------------------------------------------------------------------+
@@ -361,18 +384,10 @@ bool IsWithinDetectionWindow()
 //| no basket open the check is only the level-0 trigger, so within   |
 //| the window the basket re-opens on each fresh excursion.           |
 //+------------------------------------------------------------------+
-void ManageBasket(bool isBuy)
+void ManageBasket(bool isBuy, int count, int extremePriceInt, double pipsProfit)
 {
-    int    count = 0;
-    double pipsProfit = 0;
-    int    extremePriceInt = isBuy ? 999999999 : 0;
-
     int currentPriceInt = isBuy ? PriceToInt(SymbolInfoDouble(_Symbol, SYMBOL_ASK))
                                 : PriceToInt(SymbolInfoDouble(_Symbol, SYMBOL_BID));
-    int markPriceInt = isBuy ? PriceToInt(SymbolInfoDouble(_Symbol, SYMBOL_BID))
-                             : PriceToInt(SymbolInfoDouble(_Symbol, SYMBOL_ASK));
-
-    GetBasketStatus(isBuy, markPriceInt, count, extremePriceInt, pipsProfit);
 
     // A side excluded by OpenMode never starts a new basket; an already-open
     // one is still managed (grid adds + TP/SL) so it can wind down.
@@ -478,17 +493,21 @@ void OpenGridLevel(bool isBuy, int level)
 }
 
 //+------------------------------------------------------------------+
-//| Close every position of one direction in the basket              |
+//| Close every position of one direction in the basket, by the      |
+//| tickets CollectBasketData() already cached this tick - avoids a  |
+//| second full PositionsTotal() scan on top of the one              |
+//| CollectBasketData() just did.                                     |
 //+------------------------------------------------------------------+
 void CloseBasket(bool isBuy, double pipsProfit)
 {
     double totalLots = 0;
     int    closedCount = 0;
+    int    n = isBuy ? ArraySize(buyTickets) : ArraySize(sellTickets);
 
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    for(int i = 0; i < n; i++)
     {
-        ulong ticket = GetBasketPositionTicket(i, isBuy);
-        if(ticket == 0) continue;
+        ulong ticket = isBuy ? buyTickets[i] : sellTickets[i];
+        if(!PositionSelectByTicket(ticket)) continue;
 
         totalLots += PositionGetDouble(POSITION_VOLUME);
         if(trade.PositionClose(ticket)) closedCount++;

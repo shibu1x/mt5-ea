@@ -31,6 +31,8 @@ input int      RapidAddPauseHours = 1;       // Pause further grid adds this lon
 
 // Global Variables
 CTrade trade;
+ulong  buyTickets[];
+ulong  sellTickets[];
 int gridStepPrice;
 double pointValue;
 double cachedLotSize;
@@ -158,22 +160,39 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-    ManageBasket(true);
-    ManageBasket(false);
+    int    buyCount = 0, sellCount = 0;
+    double buyProfit = 0, sellProfit = 0;
+    int    buyExtremePriceInt = 999999999, sellExtremePriceInt = 0;
+    double buyPipsProfit = 0, sellPipsProfit = 0;
+
+    CollectBasketData(buyCount, buyProfit, buyExtremePriceInt, buyPipsProfit,
+                       sellCount, sellProfit, sellExtremePriceInt, sellPipsProfit);
+
+    ManageBasket(true,  buyCount,  buyProfit,  buyExtremePriceInt,  buyPipsProfit);
+    ManageBasket(false, sellCount, sellProfit, sellExtremePriceInt, sellPipsProfit);
 }
 
 //+------------------------------------------------------------------+
-//| Collect open position count, floating profit, volume-weighted    |
-//| average pips profit, and the extreme open price (lowest for buy, |
-//| highest for sell) of a basket. markPriceInt must be the side a   |
-//| position of this direction would actually close at (Bid for buy, |
-//| Ask for sell) - not the side used to open a new one - so          |
-//| pipsProfit matches what CloseBasket() will actually realize.      |
+//| Single PositionsTotal() pass that fills in both baskets' status  |
+//| (count, floating profit, volume-weighted average pips profit,    |
+//| extreme open price) in one scan instead of one scan per          |
+//| direction, and caches each basket's tickets in buyTickets[] /     |
+//| sellTickets[] so CloseBasket() can close by ticket instead of     |
+//| re-scanning all positions. Each side's mark price is the price a |
+//| position of that direction would actually close at (Bid for buy, |
+//| Ask for sell), matching what CloseBasket() will actually realize.|
 //+------------------------------------------------------------------+
-void GetBasketStatus(bool isBuy, int markPriceInt, int &count, double &profit, int &extremePriceInt, double &pipsProfit)
+void CollectBasketData(int &buyCount, double &buyProfit, int &buyExtremePriceInt, double &buyPipsProfit,
+                        int &sellCount, double &sellProfit, int &sellExtremePriceInt, double &sellPipsProfit)
 {
-    double weightedPriceSum = 0;
-    double totalVolume = 0;
+    ArrayResize(buyTickets, 0);
+    ArrayResize(sellTickets, 0);
+
+    double buyWeightedSum = 0, buyVolume = 0;
+    double sellWeightedSum = 0, sellVolume = 0;
+
+    int buyMarkPriceInt  = PriceToInt(SymbolInfoDouble(_Symbol, SYMBOL_BID));
+    int sellMarkPriceInt = PriceToInt(SymbolInfoDouble(_Symbol, SYMBOL_ASK));
 
     for(int i = PositionsTotal() - 1; i >= 0; i--)
     {
@@ -183,22 +202,39 @@ void GetBasketStatus(bool isBuy, int markPriceInt, int &count, double &profit, i
         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
 
         ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-        if(isBuy != (type == POSITION_TYPE_BUY)) continue;
-
-        count++;
-        profit += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
-
+        bool isBuy = (type == POSITION_TYPE_BUY);
         double volume = PositionGetDouble(POSITION_VOLUME);
         int openPrice = PriceToInt(PositionGetDouble(POSITION_PRICE_OPEN));
-        int diffInt = isBuy ? (markPriceInt - openPrice) : (openPrice - markPriceInt);
-        weightedPriceSum += diffInt * volume;
-        totalVolume += volume;
+        double posProfit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
 
-        if(isBuy) { if(openPrice < extremePriceInt) extremePriceInt = openPrice; }
-        else      { if(openPrice > extremePriceInt) extremePriceInt = openPrice; }
+        if(isBuy)
+        {
+            buyCount++;
+            buyProfit += posProfit;
+            buyWeightedSum += (buyMarkPriceInt - openPrice) * volume;
+            buyVolume += volume;
+            if(openPrice < buyExtremePriceInt) buyExtremePriceInt = openPrice;
+
+            int n = ArraySize(buyTickets);
+            ArrayResize(buyTickets, n + 1);
+            buyTickets[n] = ticket;
+        }
+        else
+        {
+            sellCount++;
+            sellProfit += posProfit;
+            sellWeightedSum += (openPrice - sellMarkPriceInt) * volume;
+            sellVolume += volume;
+            if(openPrice > sellExtremePriceInt) sellExtremePriceInt = openPrice;
+
+            int n = ArraySize(sellTickets);
+            ArrayResize(sellTickets, n + 1);
+            sellTickets[n] = ticket;
+        }
     }
 
-    pipsProfit = totalVolume > 0 ? (weightedPriceSum / totalVolume) / pipFactor : 0;
+    buyPipsProfit  = buyVolume  > 0 ? (buyWeightedSum  / buyVolume)  / pipFactor : 0;
+    sellPipsProfit = sellVolume > 0 ? (sellWeightedSum / sellVolume) / pipFactor : 0;
 }
 
 //+------------------------------------------------------------------+
@@ -209,19 +245,10 @@ void GetBasketStatus(bool isBuy, int markPriceInt, int &count, double &profit, i
 //| 0 has nothing to manage until a position carrying MagicNumber is  |
 //| opened by some other means (manual trade, script, etc.).          |
 //+------------------------------------------------------------------+
-void ManageBasket(bool isBuy)
+void ManageBasket(bool isBuy, int count, double profit, int extremePriceInt, double pipsProfit)
 {
-    int    count = 0;
-    double profit = 0;
-    double pipsProfit = 0;
-    int    extremePriceInt = isBuy ? 999999999 : 0;
-
     int currentPrice = isBuy ? PriceToInt(SymbolInfoDouble(_Symbol, SYMBOL_ASK))
                               : PriceToInt(SymbolInfoDouble(_Symbol, SYMBOL_BID));
-    int markPrice = isBuy ? PriceToInt(SymbolInfoDouble(_Symbol, SYMBOL_BID))
-                           : PriceToInt(SymbolInfoDouble(_Symbol, SYMBOL_ASK));
-
-    GetBasketStatus(isBuy, markPrice, count, profit, extremePriceInt, pipsProfit);
 
     if(count == 0)
     {
@@ -401,22 +428,21 @@ void ResetRapidAddTracking(bool isBuy)
 }
 
 //+------------------------------------------------------------------+
-//| Close every position belonging to a basket                       |
+//| Close every position belonging to a basket, by the tickets       |
+//| CollectBasketData() already cached this tick - avoids a second   |
+//| full PositionsTotal() scan on top of the one CollectBasketData() |
+//| just did.                                                         |
 //+------------------------------------------------------------------+
 void CloseBasket(bool isBuy, double profit, double pipsProfit)
 {
     double totalLots = 0;
     int    closedCount = 0;
+    int    n = isBuy ? ArraySize(buyTickets) : ArraySize(sellTickets);
 
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    for(int i = 0; i < n; i++)
     {
-        ulong ticket = PositionGetTicket(i);
-        if(ticket <= 0) continue;
-        if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-        if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
-
-        ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-        if(isBuy != (type == POSITION_TYPE_BUY)) continue;
+        ulong ticket = isBuy ? buyTickets[i] : sellTickets[i];
+        if(!PositionSelectByTicket(ticket)) continue;
 
         totalLots += PositionGetDouble(POSITION_VOLUME);
         if(trade.PositionClose(ticket)) closedCount++;
